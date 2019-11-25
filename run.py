@@ -6,7 +6,7 @@ import yaml
 import numpy as np
 from collections import Counter, defaultdict
 import datetime
-
+import sbs
 
 targetstates = {
                 0: 0.083333,
@@ -26,18 +26,8 @@ targetstates = {
                 14: 0.111111,
                 }
 
-targetstates = {(kk for kk in np.binary_repr(k, 4): v)
+targetstates = {tuple(int(kk) for kk in np.binary_repr(k, 4)): v
                 for k, v in targetstates.items()}
-
-
-def get_updates(states, n, m):
-    updates = {'w': np.zeros((n, m)), 'b': np.zeros(n+m)}
-    for istate in states:
-        state = np.array([np.bitwise_and(2**i, istate)!=0 for i in range(n+m)])
-        updates['w'] += np.outer(state[:n], state[n:]) / float(len(states))
-        updates['b'] += state / float(len(states))
-
-    return updates
 
 
 def get_model_dkl(modelstates, nhidden):
@@ -62,7 +52,7 @@ def setup_sbs(nneurons):
             "tutorial_calibration.json")
 
     bm = sbs.network.ThoroughBM(num_samplers=nneurons,
-                                sim_name=sim_name,
+                                sim_name='nest',
                                 sampler_config=sampler_config)
 
     bm.saturating_synapses_enabled = True
@@ -70,7 +60,7 @@ def setup_sbs(nneurons):
     return bm
 
 
-def run_once(w, b, duration=1e5, burn_in_time=1000.):
+def run_once(bm, w, b, duration=1e5, burn_in_time=1000.):
     bm.biases_theo = b
     bm.weights_theo = w
     bm.gather_spikes(duration=duration, dt=0.1, burn_in_time=burn_in_time)
@@ -82,7 +72,8 @@ def get_updates(states, n, m):
     updates = {'w': np.zeros((n, m)), 'b': np.zeros(n+m)}
     for state, frequency in states.items():
         updates['w'] += frequency * np.outer(state[:n], state[n:])
-        updates['b'] += frequency * state
+        print(frequency, state)
+        updates['b'] += frequency * np.array(state)
 
     return updates
 
@@ -117,14 +108,15 @@ def main(nhidden=3, scale=0.3, learningrate=0.1, nsamples=10000, rseed=42424242)
     with open('dkls.txt', 'a', buffering=0) as dklfile:
         for i in range(nupdates):
             # using 4x samples for the free run
-            modelstates = run_once(w, b, duration=nsamples*10.*4.)
+            modelstates = run_once(network, w, b, duration=nsamples*10.*4.)
             update = get_updates(modelstates, n, m)
 
             for istate, p in targetstates.items():
-                state = np.zeros(n+m)
-                state[:n] = [-500+1000*(np.bitwise_and(2**j, istate)!=0) for j in range(n)]
+                state = np.zeros_like(b)
+                print(istate)
+                state[:n] = -500 + 1000*np.array(istate)
                 state[-m:] = 0
-                clampedstates = run_once(w, b+state, duration=nsamples*10.)
+                clampedstates = run_once(network, w, b+state, duration=nsamples*10.)
                 stateupdate = get_updates(clampedstates, n, m)
                 update['w'] -= stateupdate['w'] * p
                 update['b'] -= stateupdate['b'] * p
