@@ -26,35 +26,8 @@ targetstates = {
                 14: 0.111111,
                 }
 
-
-def run_once(weight, bias, initialstate, rseedoffset=0):
-    outdict = {}
-    outdict["Config"] = {
-                         "synapseType": "exp",
-                         "nupdates": 1000000,
-                         "randomSeed": 42424242+rseedoffset, "randomSkip": 1000000,
-                         "tauref": 100,
-                         "tausyn": 100,
-                         "tauref": 1,
-                         "tausyn": 1,
-                         "output": {"outputScheme": "BinaryState", "outputEnv": False},
-                         "subsampling": 100,
-                         "delay": 1, "networkUpdateScheme": "InOrder"}
-    outdict["bias"] = bias.tolist()
-    outdict["initialstate"] = initialstate.astype(int).tolist()
-    outdict["temperature"] = {"type": "Const", "times": [0, 10000000], "values": [1., 1.]}
-    outdict["outfile"] = "out"
-    outdict["externalCurrent"] = {"type": "Const", "times": [0, 10000000], "values": [0., 0.]}
-    outdict["weight"] = []
-    for i, wline in enumerate(weight):
-        for j, w in enumerate(wline):
-            if w == 0:
-                continue
-            outdict["weight"].append([i, j, float(np.real(w))])
-
-    yaml.dump(outdict, open('sim.json', 'w'))
-
-    subprocess.call(['/home/hd/hd_hd/hd_wv385/git/neuralsampling/neuralsampler/bin/neuralsampler', 'sim.json'])
+targetstates = {(kk for kk in np.binary_repr(k, 4): v)
+                for k, v in targetstates.items()}
 
 
 def get_updates(states, n, m):
@@ -68,11 +41,9 @@ def get_updates(states, n, m):
 
 
 def get_model_dkl(modelstates, nhidden):
-    origc = Counter(modelstates)
     relstates = defaultdict(float)
-    for k, v in origc.items():
-        ind = k % 16 # 2**nvisible
-        # ind = int(k * 2**-nhidden)
+    for k, v in modelstates.items():
+        ind = k[:4]
         relstates[ind] += v
     dkl = 0.
     outstring = ""
@@ -86,70 +57,74 @@ def get_model_dkl(modelstates, nhidden):
     return dkl
 
 
-def get_states(n, m):
-    states = []
-    with open('out', 'r') as f:
-        for i, line in enumerate(f):
-            if i<4:
-                continue
-            try:
-                state = sum(int(s)*2**j for j, s in enumerate(line[:n+m]))
-                states.append(state)
-            except ValueError:
-                break
-    return states
+def setup_sbs(nneurons):
+    sampler_config = sbs.db.SamplerConfiguration.load(
+            "tutorial_calibration.json")
+
+    bm = sbs.network.ThoroughBM(num_samplers=nneurons,
+                                sim_name=sim_name,
+                                sampler_config=sampler_config)
+
+    bm.saturating_synapses_enabled = True
+    bm.use_proper_tso = True
+    return bm
 
 
-def initialstate(state=None, nvisible=4, nhidden=5):
-    if state is not None:
-        istate = np.zeros_like(state)
-        istate[state>100.] = np.random.randint(0, 100, size=sum(state>100.))
-        istate[state<100.] = np.random.randint(100, 200, size=sum(state<100.))
-        istate[nvisible:] = np.random.randint(0, 200, size=nhidden)
-        return istate
-    else:
-        return np.random.randint(0, 200, size=nhidden+nvisible)
+def run_once(w, b, duration=1e5, burn_in_time=1000.):
+    bm.biases_theo = b
+    bm.weights_theo = w
+    bm.gather_spikes(duration=duration, dt=0.1, burn_in_time=burn_in_time)
+
+    return {k: v for k, v in np.ndenumerate(bm.dist_joint_sim)}
 
 
+def get_updates(states, n, m):
+    updates = {'w': np.zeros((n, m)), 'b': np.zeros(n+m)}
+    for state, frequency in states.items():
+        updates['w'] += frequency * np.outer(state[:n], state[n:])
+        updates['b'] += frequency * state
 
-def main(nhidden=3, scale=0.3, learningrate=0.1, rseed=42424242):
+    return updates
+
+
+def main(nhidden=3, scale=0.3, learningrate=0.1, nsamples=10000, rseed=42424242):
     n = 4
     m = nhidden
     nupdates = 100000
     np.random.seed(rseed)
+    network = setup_sbs(nneurons=n+m)
 
-    wdir = 'sims/{}_{}_{}_{}'.format(m, scale, learningrate, rseed)
+    wdir = 'sims/{}_{}_{}_{}_{}'.format(m, scale, learningrate, nsamples, rseed)
     try:
         os.mkdir(wdir)
     except OSError:
         pass
     os.chdir(wdir)
 
-    b = np.random.normal(0, scale, size=n+m)
-    w = np.zeros((n+m, n+m))
-    w[n:,:n] = np.random.normal(0, scale, size=(m,n))
-    w += w.T
-
+    # get initial parameters, if not use normal distributed ones
     try:
         w = np.load('weights.txt')
         b = np.load('bias.txt')
     except:
-        pass
+        b = np.random.normal(0, scale, size=n+m)
+        w = np.zeros((n+m, n+m))
+        w[n:,:n] = np.random.normal(0, scale, size=(m, n))
+        w += w.T
+
+    network.weights_theo = w
+    network.biases_theo = b
 
     with open('dkls.txt', 'a', buffering=0) as dklfile:
         for i in range(nupdates):
-            modelstates = []
-            for _ in range(4):
-                run_once(w, b, initialstate(nvisible=n, nhidden=m), rseedoffset=i+int(np.random.randint(100)))
-                modelstates += get_states(n, m)
-
+            # using 4x samples for the free run
+            modelstates = run_once(w, b, duration=nsamples*10.*4.)
             update = get_updates(modelstates, n, m)
+
             for istate, p in targetstates.items():
                 state = np.zeros(n+m)
                 state[:n] = [-500+1000*(np.bitwise_and(2**j, istate)!=0) for j in range(n)]
                 state[-m:] = 0
-                run_once(w, b+state, initialstate(state, n, m), rseedoffset=i+int(np.random.randint(100)))
-                clampedstates = get_states(n, m)
+                clampedstates = run_once(w, b+state, duration=nsamples*10.)
                 stateupdate = get_updates(clampedstates, n, m)
                 update['w'] -= stateupdate['w'] * p
                 update['b'] -= stateupdate['b'] * p
@@ -174,12 +149,13 @@ def main(nhidden=3, scale=0.3, learningrate=0.1, rseed=42424242):
                 np.save(f, b)
 
 if __name__=="__main__":
-    if len(sys.argv) == 5:
+    if len(sys.argv) == 6:
         nhidden = int(sys.argv[1])
         scale = float(sys.argv[2])
         learingrate = float(sys.argv[3])
-        rseed = int(sys.argv[4])
-        main(nhidden, scale, learningrate, rseed)
+        nsamples = float(sys.argv[4])
+        rseed = int(sys.argv[5])
+        main(nhidden, scale, learningrate, nsamples, rseed)
     else:
         print("Using default values")
         main()
