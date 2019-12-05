@@ -60,10 +60,11 @@ def setup_sbs(nneurons):
     return bm
 
 
-def run_once(bm, w, b, duration=1e5, burn_in_time=1000.):
+def run_once(bm, w, b, duration=1e5, burn_in_time=1000., rseed=np.random.randint(2**32-1)):
     bm.biases_theo = b
     bm.weights_theo = w
-    bm.gather_spikes(duration=duration, dt=0.1, burn_in_time=burn_in_time)
+    bm.gather_spikes(duration=duration, dt=0.1, burn_in_time=burn_in_time,
+                     sim_setup_kwargs={'rng_seeds': [rseed]})
 
     return {k: v for k, v in np.ndenumerate(bm.dist_joint_sim)}
 
